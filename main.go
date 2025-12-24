@@ -5,22 +5,24 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type sshHost struct {
-	Alias    string
-	Hostname string
-	IP       string // resolved from Hostname if it's not already an IP
-	User     string
-	Port     string
+	Alias         string
+	Hostname      string
+	IP            string // resolved from Hostname if it's not already an IP
+	User          string
+	Port          string
+	LocalForwards []string
 }
 type model struct {
 	hosts        []sshHost
@@ -33,6 +35,7 @@ type model struct {
 	selectedHost sshHost
 	title        string
 	styles       styles
+	localForward string
 }
 
 type styles struct {
@@ -61,9 +64,10 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 	defer f.Close()
 
 	var (
-		hosts   []sshHost
-		aliases []string              // aliases for the current Host block
-		fields  = map[string]string{} // collected key/values for the block
+		hosts         []sshHost
+		aliases       []string              // aliases for the current Host block
+		fields        = map[string]string{} // collected key/values for the block
+		localForwards []string
 	)
 
 	// helper to read a field or ""
@@ -89,10 +93,11 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 				continue
 			}
 			h := sshHost{
-				Alias:    a,
-				Hostname: hostname,
-				User:     user,
-				Port:     port,
+				Alias:         a,
+				Hostname:      hostname,
+				User:          user,
+				Port:          port,
+				LocalForwards: append([]string{}, localForwards...),
 			}
 			// Fill IP if Hostname is an IP; otherwise try a DNS lookup (best-effort)
 			if h.Hostname != "" {
@@ -107,6 +112,7 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 		// reset for next block
 		aliases = nil
 		fields = map[string]string{}
+		localForwards = nil
 	}
 
 	sc := bufio.NewScanner(f)
@@ -139,6 +145,12 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 			aliases = parts[1:]
 		case "hostname", "user", "port":
 			fields[key] = value
+		case "localforward":
+			if len(parts) >= 2 {
+				if port := extractLocalForwardPort(strings.TrimSpace(parts[1])); port != "" {
+					localForwards = append(localForwards, port)
+				}
+			}
 		default:
 			// ignore other directives for now (IdentityFile, ProxyJump, etc.)
 		}
@@ -151,11 +163,25 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 	}
 	return hosts, nil
 }
-func initialModel(hosts []sshHost) model {
+func extractLocalForwardPort(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return ""
+	}
+	if idx := strings.Index(arg, "]:"); idx >= 0 && idx+2 < len(arg) {
+		return strings.TrimSpace(arg[idx+2:])
+	}
+	if idx := strings.LastIndex(arg, ":"); idx >= 0 && idx+1 < len(arg) {
+		return strings.TrimSpace(arg[idx+1:])
+	}
+	return arg
+}
+func initialModel(hosts []sshHost, localForward string) model {
 	return model{
-		hosts:  hosts,
-		title:  "Pick an SSH host",
-		styles: defaultStyles(),
+		hosts:        hosts,
+		title:        "Pick an SSH host",
+		styles:       defaultStyles(),
+		localForward: localForward,
 	}
 }
 
@@ -204,6 +230,9 @@ func (m model) View() string {
 
 	fmt.Fprintln(&b, m.styles.title.Render(m.title))
 	fmt.Fprintln(&b, m.styles.help.Render("Use h/j/k/l or arrows • Enter to connect • q to quit"))
+	if m.localForward != "" {
+		fmt.Fprintln(&b, m.styles.help.Render("Forwarding: "+m.localForward))
+	}
 	fmt.Fprintln(&b, "")
 
 	if len(m.hosts) == 0 {
@@ -212,18 +241,29 @@ func (m model) View() string {
 	}
 
 	for i, h := range m.hosts {
-		portText := ""
-		if h.Port != "" {
-			portText = ":" + h.Port
-		}
 		ipText := ""
 		if h.IP != "" {
-			ipText = "  IP: " + h.IP
+			ipText = "IP: " + h.IP
 		}
-		line := fmt.Sprintf(
-			"%-15s  Hostname: %-20s%s  User: %-8s%s",
-			h.Alias, h.Hostname, ipText, h.User, portText,
-		)
+
+		parts := []string{
+			fmt.Sprintf("%-15s", h.Alias),
+			fmt.Sprintf("Hostname: %-25s", h.Hostname),
+		}
+		if h.Port != "" {
+			parts = append(parts, fmt.Sprintf("Port: %-5s", h.Port))
+		}
+		parts = append(parts, fmt.Sprintf("User: %-10s", h.User))
+		if ipText != "" {
+			parts = append(parts, ipText)
+		}
+		if lfLen := len(h.LocalForwards); lfLen == 1 {
+			parts = append(parts, h.LocalForwards[0])
+		} else if lfLen > 1 {
+			parts = append(parts, "LocalForward: "+strings.Join(h.LocalForwards, ","))
+		}
+
+		line := strings.Join(parts, "  ")
 
 		if i == m.cursor {
 			fmt.Fprintln(&b, m.styles.selected.Render("> "+line))
@@ -239,19 +279,24 @@ func (m model) View() string {
 	return b.String()
 }
 
-func runSSH(host string) error {
+func runSSH(host string, localForward string) error {
 	// Replace current process with ssh for clean TTY behavior
 	bin, err := exec.LookPath("ssh")
 	if err != nil {
 		return err
 	}
-	args := []string{"ssh", host}
+	args := []string{"ssh"}
+	if localForward != "" {
+		args = append(args, "-L", localForward)
+	}
+	args = append(args, host)
 	return syscall.Exec(bin, args, os.Environ())
 }
 
 func main() {
-	var cfgPath string
+	var cfgPath, localForward string
 	flag.StringVar(&cfgPath, "config", "", "Path to ssh config (deault: ~/.ssh/config)")
+	flag.StringVar(&localForward, "L", "", "Local port forward (e.g. 8080:localhost:8080)")
 	flag.Parse()
 
 	if cfgPath == "" {
@@ -263,7 +308,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error reading config:", err)
 		os.Exit(1)
 	}
-	p := tea.NewProgram(initialModel(hosts), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(hosts, localForward), tea.WithAltScreen())
 	m, err := p.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "tui error:", err)
@@ -276,9 +321,14 @@ func main() {
 	}
 
 	// Prefer a clean handoff to ssh (replaces current process).
-	if err := runSSH(final.selectedHost.Alias); err != nil {
+	if err := runSSH(final.selectedHost.Alias, localForward); err != nil {
 		// Fallback: spawn ssh as a subprocess.
-		cmd := exec.Command("ssh", final.selectedHost.Alias)
+		args := []string{}
+		if localForward != "" {
+			args = append(args, "-L", localForward)
+		}
+		args = append(args, final.selectedHost.Alias)
+		cmd := exec.Command("ssh", args...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
