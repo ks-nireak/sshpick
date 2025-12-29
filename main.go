@@ -23,6 +23,7 @@ type sshHost struct {
 	User          string
 	Port          string
 	LocalForwards []string
+	Notes         []string
 }
 type model struct {
 	hosts        []sshHost
@@ -30,6 +31,7 @@ type model struct {
 	ready        bool
 	width        int
 	height       int
+	showNotes    bool
 	err          error
 	chosen       bool
 	selectedHost sshHost
@@ -68,6 +70,7 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 		aliases       []string              // aliases for the current Host block
 		fields        = map[string]string{} // collected key/values for the block
 		localForwards []string
+		notes         []string
 	)
 
 	// helper to read a field or ""
@@ -98,6 +101,7 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 				User:          user,
 				Port:          port,
 				LocalForwards: append([]string{}, localForwards...),
+				Notes:         append([]string{}, notes...),
 			}
 			// Fill IP if Hostname is an IP; otherwise try a DNS lookup (best-effort)
 			if h.Hostname != "" {
@@ -113,28 +117,43 @@ func parseSSHConfig(path string) ([]sshHost, error) {
 		aliases = nil
 		fields = map[string]string{}
 		localForwards = nil
+		notes = nil
 	}
 
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		line := sc.Text()
-
-		// strip comments
-		if i := strings.Index(line, "#"); i >= 0 {
-			line = line[:i]
-		}
-		line = strings.TrimSpace(line)
+		raw := sc.Text()
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
-
+		if strings.HasPrefix(line, "#") {
+			if note := strings.TrimSpace(line[1:]); note != "" {
+				notes = append(notes, note)
+			}
+			continue
+		}
+		comment := ""
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			comment = strings.TrimSpace(line[idx+1:])
+			line = strings.TrimSpace(line[:idx])
+			if line == "" {
+				if comment != "" {
+					notes = append(notes, comment)
+				}
+				continue
+			}
+		}
+		if comment != "" {
+			notes = append(notes, comment)
+		}
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
 			continue
 		}
 
 		key := strings.ToLower(parts[0])
-		// value is the original text after the key (preserves spaces inside)
+		// value is the text after the key (preserves spaces inside)
 		value := strings.TrimSpace(line[len(parts[0]):])
 
 		switch key {
@@ -213,6 +232,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chosen = true
 			m.selectedHost = m.hosts[m.cursor]
 			return m, tea.Quit
+		case "n":
+			m.showNotes = !m.showNotes
 		}
 
 	case tea.WindowSizeMsg:
@@ -229,7 +250,7 @@ func (m model) View() string {
 	var b strings.Builder
 
 	fmt.Fprintln(&b, m.styles.title.Render(m.title))
-	fmt.Fprintln(&b, m.styles.help.Render("Use h/j/k/l or arrows • Enter to connect • q to quit"))
+	fmt.Fprintln(&b, m.styles.help.Render("Use h/j/k/l or arrows • n to toggle notes • Enter to connect • q to quit"))
 	if m.localForward != "" {
 		fmt.Fprintln(&b, m.styles.help.Render("Forwarding: "+m.localForward))
 	}
@@ -269,6 +290,14 @@ func (m model) View() string {
 			fmt.Fprintln(&b, m.styles.selected.Render("> "+line))
 		} else {
 			fmt.Fprintln(&b, m.styles.item.Render("  "+line))
+		}
+		if m.showNotes && len(h.Notes) > 0 {
+			for _, note := range h.Notes {
+				if note == "" {
+					continue
+				}
+				fmt.Fprintln(&b, m.styles.help.Render("    > "+note))
+			}
 		}
 	}
 
